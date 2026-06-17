@@ -15,6 +15,7 @@
 #include <queue>
 #include <sstream>
 #include <string>
+#include <utility>
 #include <vector>
 
 #pragma comment(lib, "comctl32.lib")
@@ -22,190 +23,299 @@
 // ============================= 数据结构与调度算法区域 =============================
 
 struct Process {
-    std::wstring name;      // 进程名
-    int arrival = 0;        // 到达时间
-    int service = 0;        // 服务时间
-    int priority = 0;       // 优先级：数字越小优先级越高
-    int start = -1;         // 开始时间
-    int finish = 0;         // 完成时间
-    int turnaround = 0;     // 周转时间
-    double weighted = 0.0;  // 带权周转时间
+    std::wstring name;                 // 进程名
+    int arrivalTime = 0;               // 到达时间
+    int burstTime = 0;                 // 服务时间/运行时间
+    int remainingTime = 0;             // 剩余运行时间，抢占式算法和 RR 使用
+    int priority = 0;                  // 优先级：数字越小优先级越高
+    int startTime = -1;                // 第一次获得 CPU 的时间
+    int finishTime = 0;                // 完成时间
+    int turnaroundTime = 0;            // 周转时间 = 完成时间 - 到达时间
+    double weightedTurnaroundTime = 0; // 带权周转时间 = 周转时间 / 服务时间
+    int inputOrder = 0;                // 输入顺序，用于稳定同分排序
 };
 
-struct GanttSegment {
-    std::wstring name;      // 运行进程名
-    int start = 0;          // 片段开始时间
-    int end = 0;            // 片段结束时间
+struct GanttBlock {
+    std::wstring processName;          // 运行进程名
+    int startTime = 0;                 // 片段开始时间
+    int endTime = 0;                   // 片段结束时间
 };
 
 struct ScheduleResult {
     std::vector<Process> processes;
-    std::vector<GanttSegment> segments;
-    double avgTurnaround = 0.0;
-    double avgWeighted = 0.0;
+    std::vector<GanttBlock> ganttBlocks;
+    double averageTurnaroundTime = 0;
+    double averageWeightedTurnaroundTime = 0;
+    std::wstring scheduleOrder;
 };
 
-static void FinishStatistics(ScheduleResult& result) {
-    double totalTurnaround = 0.0;
-    double totalWeighted = 0.0;
-    for (auto& p : result.processes) {
-        p.turnaround = p.finish - p.arrival;
-        p.weighted = static_cast<double>(p.turnaround) / p.service;
-        totalTurnaround += p.turnaround;
-        totalWeighted += p.weighted;
-    }
-    if (!result.processes.empty()) {
-        result.avgTurnaround = totalTurnaround / result.processes.size();
-        result.avgWeighted = totalWeighted / result.processes.size();
-    }
-}
-
-static void AddSegment(std::vector<GanttSegment>& segments, const std::wstring& name, int start, int end, bool mergeAdjacent = true) {
+static void addGanttBlock(std::vector<GanttBlock>& blocks, const std::wstring& name, int start, int end) {
     if (start >= end) return;
-    // 非 RR 算法可合并相邻且进程相同的运行片段；RR 保留每个时间片，便于观察轮转。
-    if (mergeAdjacent && !segments.empty() && segments.back().name == name && segments.back().end == start) {
-        segments.back().end = end;
+    // 连续执行同一个进程的相邻时间片合并，避免抢占式算法甘特图过碎。
+    if (!blocks.empty() && blocks.back().processName == name && blocks.back().endTime == start) {
+        blocks.back().endTime = end;
     } else {
-        segments.push_back({name, start, end});
+        blocks.push_back({ name, start, end });
     }
 }
 
-// FCFS：先来先服务，按到达时间排序，到达时间相同则保持输入顺序。
-static ScheduleResult ScheduleFCFS(const std::vector<Process>& input) {
+static void finishStatistics(ScheduleResult& result) {
+    double totalTurnaround = 0;
+    double totalWeighted = 0;
+    for (auto& p : result.processes) {
+        p.turnaroundTime = p.finishTime - p.arrivalTime;
+        p.weightedTurnaroundTime = static_cast<double>(p.turnaroundTime) / p.burstTime;
+        totalTurnaround += p.turnaroundTime;
+        totalWeighted += p.weightedTurnaroundTime;
+    }
+    std::stable_sort(result.processes.begin(), result.processes.end(), [](const Process& a, const Process& b) {
+        return a.inputOrder < b.inputOrder;
+    });
+    if (!result.processes.empty()) {
+        result.averageTurnaroundTime = totalTurnaround / result.processes.size();
+        result.averageWeightedTurnaroundTime = totalWeighted / result.processes.size();
+    }
+
+    result.scheduleOrder.clear();
+    for (size_t i = 0; i < result.ganttBlocks.size(); ++i) {
+        if (i) result.scheduleOrder += L" -> ";
+        result.scheduleOrder += result.ganttBlocks[i].processName;
+    }
+}
+
+static int earliestArrival(const std::vector<Process>& processes) {
+    int earliest = INT_MAX;
+    for (const auto& p : processes) earliest = std::min(earliest, p.arrivalTime);
+    return earliest == INT_MAX ? 0 : earliest;
+}
+
+// 1. FCFS：先来先服务，按到达时间排序，到达时间相同则按输入顺序。
+static ScheduleResult scheduleFCFS(std::vector<Process> processes) {
     ScheduleResult result;
-    result.processes = input;
-    std::vector<int> order(input.size());
+    result.processes = std::move(processes);
+    std::vector<int> order(result.processes.size());
     std::iota(order.begin(), order.end(), 0);
     std::stable_sort(order.begin(), order.end(), [&](int a, int b) {
-        return input[a].arrival < input[b].arrival;
+        const auto& pa = result.processes[a];
+        const auto& pb = result.processes[b];
+        if (pa.arrivalTime != pb.arrivalTime) return pa.arrivalTime < pb.arrivalTime;
+        return pa.inputOrder < pb.inputOrder;
     });
 
-    int current = 0;
+    int currentTime = earliestArrival(result.processes);
     for (int idx : order) {
         auto& p = result.processes[idx];
-        current = std::max(current, p.arrival);
-        p.start = current;
-        p.finish = current + p.service;
-        AddSegment(result.segments, p.name, p.start, p.finish);
-        current = p.finish;
+        currentTime = std::max(currentTime, p.arrivalTime);
+        p.startTime = currentTime;
+        p.finishTime = currentTime + p.burstTime;
+        p.remainingTime = 0;
+        addGanttBlock(result.ganttBlocks, p.name, p.startTime, p.finishTime);
+        currentTime = p.finishTime;
     }
-    FinishStatistics(result);
+    finishStatistics(result);
     return result;
 }
 
-// SJF：非抢占式短作业优先，每次选择当前已到达且服务时间最短的进程。
-static ScheduleResult ScheduleSJF(const std::vector<Process>& input) {
+// 2. SJF 非抢占式：CPU 空闲时选择已到达且服务时间最短的进程，执行后不被打断。
+static ScheduleResult scheduleSJFNonPreemptive(std::vector<Process> processes) {
     ScheduleResult result;
-    result.processes = input;
-    const int n = static_cast<int>(input.size());
+    result.processes = std::move(processes);
+    const int n = static_cast<int>(result.processes.size());
     std::vector<bool> done(n, false);
     int finished = 0;
-    int current = 0;
+    int currentTime = earliestArrival(result.processes);
 
     while (finished < n) {
         int best = -1;
         for (int i = 0; i < n; ++i) {
-            if (done[i] || result.processes[i].arrival > current) continue;
-            if (best == -1 || result.processes[i].service < result.processes[best].service ||
-                (result.processes[i].service == result.processes[best].service && result.processes[i].arrival < result.processes[best].arrival)) {
+            if (done[i] || result.processes[i].arrivalTime > currentTime) continue;
+            if (best == -1 ||
+                result.processes[i].burstTime < result.processes[best].burstTime ||
+                (result.processes[i].burstTime == result.processes[best].burstTime && result.processes[i].arrivalTime < result.processes[best].arrivalTime) ||
+                (result.processes[i].burstTime == result.processes[best].burstTime && result.processes[i].arrivalTime == result.processes[best].arrivalTime && result.processes[i].inputOrder < result.processes[best].inputOrder)) {
                 best = i;
             }
         }
         if (best == -1) {
             int nextArrival = INT_MAX;
-            for (int i = 0; i < n; ++i) if (!done[i]) nextArrival = std::min(nextArrival, result.processes[i].arrival);
-            current = nextArrival;
+            for (int i = 0; i < n; ++i) if (!done[i]) nextArrival = std::min(nextArrival, result.processes[i].arrivalTime);
+            currentTime = nextArrival;
             continue;
         }
         auto& p = result.processes[best];
-        p.start = current;
-        p.finish = current + p.service;
-        AddSegment(result.segments, p.name, p.start, p.finish);
-        current = p.finish;
+        p.startTime = currentTime;
+        p.finishTime = currentTime + p.burstTime;
+        p.remainingTime = 0;
+        addGanttBlock(result.ganttBlocks, p.name, p.startTime, p.finishTime);
+        currentTime = p.finishTime;
         done[best] = true;
         ++finished;
     }
-    FinishStatistics(result);
+    finishStatistics(result);
     return result;
 }
 
-// Priority：非抢占式优先级调度，数字越小优先级越高。
-static ScheduleResult SchedulePriority(const std::vector<Process>& input) {
+// 3. SRTF 抢占式短作业优先：每个时间单位选择剩余时间最短的进程。
+static ScheduleResult scheduleSRTFPreemptive(std::vector<Process> processes) {
     ScheduleResult result;
-    result.processes = input;
-    const int n = static_cast<int>(input.size());
-    std::vector<bool> done(n, false);
+    result.processes = std::move(processes);
+    const int n = static_cast<int>(result.processes.size());
+    for (auto& p : result.processes) p.remainingTime = p.burstTime;
     int finished = 0;
-    int current = 0;
+    int currentTime = earliestArrival(result.processes);
 
     while (finished < n) {
         int best = -1;
         for (int i = 0; i < n; ++i) {
-            if (done[i] || result.processes[i].arrival > current) continue;
-            if (best == -1 || result.processes[i].priority < result.processes[best].priority ||
-                (result.processes[i].priority == result.processes[best].priority && result.processes[i].arrival < result.processes[best].arrival)) {
+            const auto& p = result.processes[i];
+            if (p.arrivalTime > currentTime || p.remainingTime <= 0) continue;
+            if (best == -1 ||
+                p.remainingTime < result.processes[best].remainingTime ||
+                (p.remainingTime == result.processes[best].remainingTime && p.arrivalTime < result.processes[best].arrivalTime) ||
+                (p.remainingTime == result.processes[best].remainingTime && p.arrivalTime == result.processes[best].arrivalTime && p.inputOrder < result.processes[best].inputOrder)) {
+                best = i;
+            }
+        }
+        if (best == -1) { ++currentTime; continue; }
+        auto& p = result.processes[best];
+        if (p.startTime == -1) p.startTime = currentTime;
+        addGanttBlock(result.ganttBlocks, p.name, currentTime, currentTime + 1);
+        --p.remainingTime;
+        ++currentTime;
+        if (p.remainingTime == 0) {
+            p.finishTime = currentTime;
+            ++finished;
+        }
+    }
+    finishStatistics(result);
+    return result;
+}
+
+// 4. Priority 非抢占式：CPU 空闲时选择优先级最高（数字最小）的进程，执行后不被打断。
+static ScheduleResult schedulePriorityNonPreemptive(std::vector<Process> processes) {
+    ScheduleResult result;
+    result.processes = std::move(processes);
+    const int n = static_cast<int>(result.processes.size());
+    std::vector<bool> done(n, false);
+    int finished = 0;
+    int currentTime = earliestArrival(result.processes);
+
+    while (finished < n) {
+        int best = -1;
+        for (int i = 0; i < n; ++i) {
+            if (done[i] || result.processes[i].arrivalTime > currentTime) continue;
+            if (best == -1 ||
+                result.processes[i].priority < result.processes[best].priority ||
+                (result.processes[i].priority == result.processes[best].priority && result.processes[i].arrivalTime < result.processes[best].arrivalTime) ||
+                (result.processes[i].priority == result.processes[best].priority && result.processes[i].arrivalTime == result.processes[best].arrivalTime && result.processes[i].inputOrder < result.processes[best].inputOrder)) {
                 best = i;
             }
         }
         if (best == -1) {
             int nextArrival = INT_MAX;
-            for (int i = 0; i < n; ++i) if (!done[i]) nextArrival = std::min(nextArrival, result.processes[i].arrival);
-            current = nextArrival;
+            for (int i = 0; i < n; ++i) if (!done[i]) nextArrival = std::min(nextArrival, result.processes[i].arrivalTime);
+            currentTime = nextArrival;
             continue;
         }
         auto& p = result.processes[best];
-        p.start = current;
-        p.finish = current + p.service;
-        AddSegment(result.segments, p.name, p.start, p.finish);
-        current = p.finish;
+        p.startTime = currentTime;
+        p.finishTime = currentTime + p.burstTime;
+        p.remainingTime = 0;
+        addGanttBlock(result.ganttBlocks, p.name, p.startTime, p.finishTime);
+        currentTime = p.finishTime;
         done[best] = true;
         ++finished;
     }
-    FinishStatistics(result);
+    finishStatistics(result);
     return result;
 }
 
-// RR：时间片轮转，同一进程可多次进入 CPU，因此甘特图保留多个片段。
-static ScheduleResult ScheduleRR(const std::vector<Process>& input, int quantum) {
+// 5. Preemptive Priority：每个时间单位选择优先级最高的进程，高优先级到达时可抢占。
+static ScheduleResult schedulePriorityPreemptive(std::vector<Process> processes) {
     ScheduleResult result;
-    result.processes = input;
-    const int n = static_cast<int>(input.size());
-    std::vector<int> remain(n);
-    for (int i = 0; i < n; ++i) remain[i] = input[i].service;
+    result.processes = std::move(processes);
+    const int n = static_cast<int>(result.processes.size());
+    for (auto& p : result.processes) p.remainingTime = p.burstTime;
+    int finished = 0;
+    int currentTime = earliestArrival(result.processes);
+
+    while (finished < n) {
+        int best = -1;
+        for (int i = 0; i < n; ++i) {
+            const auto& p = result.processes[i];
+            if (p.arrivalTime > currentTime || p.remainingTime <= 0) continue;
+            if (best == -1 ||
+                p.priority < result.processes[best].priority ||
+                (p.priority == result.processes[best].priority && p.remainingTime < result.processes[best].remainingTime) ||
+                (p.priority == result.processes[best].priority && p.remainingTime == result.processes[best].remainingTime && p.arrivalTime < result.processes[best].arrivalTime) ||
+                (p.priority == result.processes[best].priority && p.remainingTime == result.processes[best].remainingTime && p.arrivalTime == result.processes[best].arrivalTime && p.inputOrder < result.processes[best].inputOrder)) {
+                best = i;
+            }
+        }
+        if (best == -1) { ++currentTime; continue; }
+        auto& p = result.processes[best];
+        if (p.startTime == -1) p.startTime = currentTime;
+        addGanttBlock(result.ganttBlocks, p.name, currentTime, currentTime + 1);
+        --p.remainingTime;
+        ++currentTime;
+        if (p.remainingTime == 0) {
+            p.finishTime = currentTime;
+            ++finished;
+        }
+    }
+    finishStatistics(result);
+    return result;
+}
+
+// 6. RR：时间片轮转，进程按到达时间和输入顺序进入就绪队列。
+static ScheduleResult scheduleRR(std::vector<Process> processes, int timeQuantum) {
+    ScheduleResult result;
+    result.processes = std::move(processes);
+    const int n = static_cast<int>(result.processes.size());
+    for (auto& p : result.processes) p.remainingTime = p.burstTime;
 
     std::vector<int> order(n);
     std::iota(order.begin(), order.end(), 0);
-    std::stable_sort(order.begin(), order.end(), [&](int a, int b) { return input[a].arrival < input[b].arrival; });
+    std::stable_sort(order.begin(), order.end(), [&](int a, int b) {
+        const auto& pa = result.processes[a];
+        const auto& pb = result.processes[b];
+        if (pa.arrivalTime != pb.arrivalTime) return pa.arrivalTime < pb.arrivalTime;
+        return pa.inputOrder < pb.inputOrder;
+    });
 
     std::queue<int> ready;
-    int current = 0, finished = 0, next = 0;
+    int currentTime = earliestArrival(result.processes);
+    int finished = 0;
+    int next = 0;
     auto pushArrived = [&]() {
-        while (next < n && input[order[next]].arrival <= current) ready.push(order[next++]);
+        while (next < n && result.processes[order[next]].arrivalTime <= currentTime) {
+            ready.push(order[next++]);
+        }
     };
 
     while (finished < n) {
         pushArrived();
         if (ready.empty()) {
-            current = std::max(current, input[order[next]].arrival);
+            currentTime = std::max(currentTime, result.processes[order[next]].arrivalTime);
             pushArrived();
         }
         int idx = ready.front();
         ready.pop();
         auto& p = result.processes[idx];
-        if (p.start == -1) p.start = current;
-        int run = std::min(quantum, remain[idx]);
-        AddSegment(result.segments, p.name, current, current + run, false);
-        current += run;
-        remain[idx] -= run;
+        if (p.startTime == -1) p.startTime = currentTime;
+        int runTime = std::min(timeQuantum, p.remainingTime);
+        addGanttBlock(result.ganttBlocks, p.name, currentTime, currentTime + runTime);
+        currentTime += runTime;
+        p.remainingTime -= runTime;
         pushArrived();
-        if (remain[idx] > 0) {
+        if (p.remainingTime > 0) {
             ready.push(idx);
         } else {
-            p.finish = current;
+            p.finishTime = currentTime;
             ++finished;
         }
     }
-    FinishStatistics(result);
+    finishStatistics(result);
     return result;
 }
 
@@ -223,13 +333,32 @@ static ScheduleResult ScheduleRR(const std::vector<Process>& input, int quantum)
 #define IDC_START 1010
 #define IDC_PROCESS_LIST 1011
 #define IDC_RESULT_LIST 1012
+#define IDC_ALGO_DESC 1013
 
 static HINSTANCE g_hInst;
 static HWND g_nameEdit, g_arrivalEdit, g_serviceEdit, g_priorityEdit, g_quantumEdit;
-static HWND g_algoCombo, g_processList, g_resultList;
+static HWND g_algoCombo, g_processList, g_resultList, g_algoDesc;
 static std::vector<Process> g_processes;
+static int g_nextInputOrder = 0;
 static ScheduleResult g_lastResult;
 static bool g_hasResult = false;
+
+static const wchar_t* GetAlgorithmDescription(int algo) {
+    switch (algo) {
+    case 0: return L"FCFS：按照进程到达时间先后顺序依次执行。";
+    case 1: return L"SJF 非抢占式：CPU 空闲时选择已到达进程中服务时间最短者执行，执行后不被打断。";
+    case 2: return L"SRTF 抢占式：每个时间单位选择剩余时间最短的进程，新短作业到达时可能抢占。";
+    case 3: return L"Priority 非抢占式：CPU 空闲时选择优先级最高的进程，执行后不被打断。";
+    case 4: return L"Preemptive Priority：高优先级进程到达时可以抢占当前进程。";
+    case 5: return L"RR：按照时间片轮转执行，就绪队列中的进程轮流获得 CPU。";
+    default: return L"请选择调度算法。";
+    }
+}
+
+static void UpdateAlgorithmDescription() {
+    if (g_algoDesc) SetWindowTextW(g_algoDesc, GetAlgorithmDescription(ComboBox_GetCurSel(g_algoCombo)));
+}
+
 
 static std::wstring GetWindowTextString(HWND hwnd) {
     int len = GetWindowTextLengthW(hwnd);
@@ -265,8 +394,8 @@ static void RefreshProcessList() {
         item.iItem = i;
         item.pszText = const_cast<LPWSTR>(p.name.c_str());
         ListView_InsertItem(g_processList, &item);
-        ListView_SetItemText(g_processList, i, 1, const_cast<LPWSTR>(std::to_wstring(p.arrival).c_str()));
-        ListView_SetItemText(g_processList, i, 2, const_cast<LPWSTR>(std::to_wstring(p.service).c_str()));
+        ListView_SetItemText(g_processList, i, 1, const_cast<LPWSTR>(std::to_wstring(p.arrivalTime).c_str()));
+        ListView_SetItemText(g_processList, i, 2, const_cast<LPWSTR>(std::to_wstring(p.burstTime).c_str()));
         ListView_SetItemText(g_processList, i, 3, const_cast<LPWSTR>(std::to_wstring(p.priority).c_str()));
     }
 }
@@ -287,11 +416,14 @@ static void RefreshResultList() {
         item.iItem = i;
         item.pszText = const_cast<LPWSTR>(p.name.c_str());
         ListView_InsertItem(g_resultList, &item);
-        ListView_SetItemText(g_resultList, i, 1, const_cast<LPWSTR>(std::to_wstring(p.start).c_str()));
-        ListView_SetItemText(g_resultList, i, 2, const_cast<LPWSTR>(std::to_wstring(p.finish).c_str()));
-        ListView_SetItemText(g_resultList, i, 3, const_cast<LPWSTR>(std::to_wstring(p.turnaround).c_str()));
-        std::wstring w = FormatDouble(p.weighted);
-        ListView_SetItemText(g_resultList, i, 4, const_cast<LPWSTR>(w.c_str()));
+        ListView_SetItemText(g_resultList, i, 1, const_cast<LPWSTR>(std::to_wstring(p.arrivalTime).c_str()));
+        ListView_SetItemText(g_resultList, i, 2, const_cast<LPWSTR>(std::to_wstring(p.burstTime).c_str()));
+        ListView_SetItemText(g_resultList, i, 3, const_cast<LPWSTR>(std::to_wstring(p.priority).c_str()));
+        ListView_SetItemText(g_resultList, i, 4, const_cast<LPWSTR>(std::to_wstring(p.startTime).c_str()));
+        ListView_SetItemText(g_resultList, i, 5, const_cast<LPWSTR>(std::to_wstring(p.finishTime).c_str()));
+        ListView_SetItemText(g_resultList, i, 6, const_cast<LPWSTR>(std::to_wstring(p.turnaroundTime).c_str()));
+        std::wstring w = FormatDouble(p.weightedTurnaroundTime);
+        ListView_SetItemText(g_resultList, i, 7, const_cast<LPWSTR>(w.c_str()));
     }
 }
 
@@ -312,13 +444,13 @@ static void DrawGanttChart(HDC hdc, RECT rc) {
 
     SetBkMode(hdc, TRANSPARENT);
     TextOutW(hdc, rc.left + 10, rc.top + 8, L"甘特图", 3);
-    if (!g_hasResult || g_lastResult.segments.empty()) {
+    if (!g_hasResult || g_lastResult.ganttBlocks.empty()) {
         TextOutW(hdc, rc.left + 10, rc.top + 40, L"请添加进程并点击“开始调度”。", lstrlenW(L"请添加进程并点击“开始调度”。"));
         return;
     }
 
-    int minTime = g_lastResult.segments.front().start;
-    int maxTime = g_lastResult.segments.back().end;
+    int minTime = g_lastResult.ganttBlocks.front().startTime;
+    int maxTime = g_lastResult.ganttBlocks.back().endTime;
     int total = std::max(1, maxTime - minTime);
     int x0 = rc.left + 30;
     int y0 = rc.top + 60;
@@ -328,31 +460,27 @@ static void DrawGanttChart(HDC hdc, RECT rc) {
     std::map<std::wstring, COLORREF> colorMap;
     int colorIndex = 0;
 
-    for (const auto& s : g_lastResult.segments) {
-        if (!colorMap.count(s.name)) colorMap[s.name] = colors[colorIndex++ % 6];
-        int x1 = x0 + (s.start - minTime) * width / total;
-        int x2 = x0 + (s.end - minTime) * width / total;
-        HBRUSH brush = CreateSolidBrush(colorMap[s.name]);
+    for (const auto& s : g_lastResult.ganttBlocks) {
+        if (!colorMap.count(s.processName)) colorMap[s.processName] = colors[colorIndex++ % 6];
+        int x1 = x0 + (s.startTime - minTime) * width / total;
+        int x2 = x0 + (s.endTime - minTime) * width / total;
+        HBRUSH brush = CreateSolidBrush(colorMap[s.processName]);
         RECT block{ x1, y0, x2, y0 + height };
         FillRect(hdc, &block, brush);
         DeleteObject(brush);
         Rectangle(hdc, block.left, block.top, block.right, block.bottom);
-        DrawTextW(hdc, s.name.c_str(), -1, &block, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        DrawTextW(hdc, s.processName.c_str(), -1, &block, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
 
-        std::wstring startText = std::to_wstring(s.start);
+        std::wstring startText = std::to_wstring(s.startTime);
         TextOutW(hdc, x1 - 4, y0 + height + 8, startText.c_str(), static_cast<int>(startText.size()));
-        std::wstring endText = std::to_wstring(s.end);
+        std::wstring endText = std::to_wstring(s.endTime);
         TextOutW(hdc, x2 - 4, y0 + height + 8, endText.c_str(), static_cast<int>(endText.size()));
     }
 
-    std::wstring order = L"调度顺序：";
-    for (size_t i = 0; i < g_lastResult.segments.size(); ++i) {
-        if (i) order += L" -> ";
-        order += g_lastResult.segments[i].name;
-    }
+    std::wstring order = L"调度顺序：" + g_lastResult.scheduleOrder;
     TextOutW(hdc, rc.left + 10, y0 + height + 40, order.c_str(), static_cast<int>(order.size()));
 
-    std::wstring avg = L"平均周转时间：" + FormatDouble(g_lastResult.avgTurnaround) + L"    平均带权周转时间：" + FormatDouble(g_lastResult.avgWeighted);
+    std::wstring avg = L"平均周转时间：" + FormatDouble(g_lastResult.averageTurnaroundTime) + L"    平均带权周转时间：" + FormatDouble(g_lastResult.averageWeightedTurnaroundTime);
     TextOutW(hdc, rc.left + 10, y0 + height + 68, avg.c_str(), static_cast<int>(avg.size()));
 }
 
@@ -360,9 +488,11 @@ static void AddProcessFromInput(HWND hwnd) {
     Process p;
     p.name = GetWindowTextString(g_nameEdit);
     if (p.name.empty()) { ShowError(L"进程名不能为空。 "); return; }
-    if (!ParseInt(GetWindowTextString(g_arrivalEdit), p.arrival) || p.arrival < 0) { ShowError(L"到达时间必须是不小于 0 的整数。 "); return; }
-    if (!ParseInt(GetWindowTextString(g_serviceEdit), p.service) || p.service <= 0) { ShowError(L"服务时间必须是大于 0 的整数。 "); return; }
+    if (!ParseInt(GetWindowTextString(g_arrivalEdit), p.arrivalTime) || p.arrivalTime < 0) { ShowError(L"到达时间必须是不小于 0 的整数。 "); return; }
+    if (!ParseInt(GetWindowTextString(g_serviceEdit), p.burstTime) || p.burstTime <= 0) { ShowError(L"服务时间必须是大于 0 的整数。 "); return; }
     if (!ParseInt(GetWindowTextString(g_priorityEdit), p.priority)) { ShowError(L"优先级必须是整数，数字越小优先级越高。 "); return; }
+    p.remainingTime = p.burstTime;
+    p.inputOrder = g_nextInputOrder++;
     g_processes.push_back(p);
     g_hasResult = false;
     RefreshProcessList();
@@ -373,13 +503,15 @@ static void AddProcessFromInput(HWND hwnd) {
 static void StartSchedule(HWND hwnd) {
     if (g_processes.empty()) { ShowError(L"请至少添加一个进程。 "); return; }
     int algo = ComboBox_GetCurSel(g_algoCombo);
-    if (algo == 0) g_lastResult = ScheduleFCFS(g_processes);
-    else if (algo == 1) g_lastResult = ScheduleSJF(g_processes);
-    else if (algo == 2) g_lastResult = SchedulePriority(g_processes);
+    if (algo == 0) g_lastResult = scheduleFCFS(g_processes);
+    else if (algo == 1) g_lastResult = scheduleSJFNonPreemptive(g_processes);
+    else if (algo == 2) g_lastResult = scheduleSRTFPreemptive(g_processes);
+    else if (algo == 3) g_lastResult = schedulePriorityNonPreemptive(g_processes);
+    else if (algo == 4) g_lastResult = schedulePriorityPreemptive(g_processes);
     else {
         int quantum = 0;
         if (!ParseInt(GetWindowTextString(g_quantumEdit), quantum) || quantum <= 0) { ShowError(L"RR 时间片必须是大于 0 的整数。 "); return; }
-        g_lastResult = ScheduleRR(g_processes, quantum);
+        g_lastResult = scheduleRR(g_processes, quantum);
     }
     g_hasResult = true;
     RefreshResultList();
@@ -413,34 +545,45 @@ static void CreateControls(HWND hwnd) {
     button(IDC_CLEAR, 890, 10, 90, L"清空进程");
 
     label(15, 55, L"调度算法");
-    g_algoCombo = CreateWindowW(L"COMBOBOX", L"", WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST, 90, 52, 220, 200, hwnd, reinterpret_cast<HMENU>(IDC_ALGO), g_hInst, nullptr);
+    g_algoCombo = CreateWindowW(L"COMBOBOX", L"", WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST, 90, 52, 300, 200, hwnd, reinterpret_cast<HMENU>(IDC_ALGO), g_hInst, nullptr);
     SendMessageW(g_algoCombo, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
     ComboBox_AddString(g_algoCombo, L"FCFS 先来先服务");
-    ComboBox_AddString(g_algoCombo, L"SJF 短作业优先");
-    ComboBox_AddString(g_algoCombo, L"Priority 优先级调度");
+    ComboBox_AddString(g_algoCombo, L"SJF 非抢占式短作业优先");
+    ComboBox_AddString(g_algoCombo, L"SRTF 抢占式短作业优先");
+    ComboBox_AddString(g_algoCombo, L"Priority 非抢占式优先级调度");
+    ComboBox_AddString(g_algoCombo, L"Preemptive Priority 抢占式优先级调度");
     ComboBox_AddString(g_algoCombo, L"RR 时间片轮转");
     ComboBox_SetCurSel(g_algoCombo, 0);
-    label(330, 55, L"时间片");     g_quantumEdit = edit(IDC_QUANTUM, 390, 52, 70, L"2");
-    button(IDC_START, 480, 50, 110, L"开始调度");
+    label(405, 55, L"时间片");     g_quantumEdit = edit(IDC_QUANTUM, 465, 52, 60, L"2");
+    button(IDC_START, 540, 50, 100, L"开始调度");
+
+    CreateWindowW(L"STATIC", L"算法说明", WS_CHILD | WS_VISIBLE, 650, 55, 80, 24, hwnd, nullptr, g_hInst, nullptr);
+    g_algoDesc = CreateWindowW(L"STATIC", L"", WS_CHILD | WS_VISIBLE | WS_BORDER | SS_LEFT,
+                               730, 50, 430, 44, hwnd, reinterpret_cast<HMENU>(IDC_ALGO_DESC), g_hInst, nullptr);
+    SendMessageW(g_algoDesc, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
+    UpdateAlgorithmDescription();
 
     CreateWindowW(L"STATIC", L"输入进程信息列表", WS_CHILD | WS_VISIBLE, 15, 92, 160, 24, hwnd, nullptr, g_hInst, nullptr);
     g_processList = CreateWindowW(WC_LISTVIEWW, L"", WS_CHILD | WS_VISIBLE | WS_BORDER | LVS_REPORT | LVS_SINGLESEL,
-                                  15, 120, 470, 210, hwnd, reinterpret_cast<HMENU>(IDC_PROCESS_LIST), g_hInst, nullptr);
+                                  15, 120, 430, 210, hwnd, reinterpret_cast<HMENU>(IDC_PROCESS_LIST), g_hInst, nullptr);
     ListView_SetExtendedListViewStyle(g_processList, LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES);
     AddListColumn(g_processList, 0, 120, L"进程名");
     AddListColumn(g_processList, 1, 100, L"到达时间");
     AddListColumn(g_processList, 2, 100, L"服务时间");
     AddListColumn(g_processList, 3, 100, L"优先级");
 
-    CreateWindowW(L"STATIC", L"调度结果列表", WS_CHILD | WS_VISIBLE, 510, 92, 160, 24, hwnd, nullptr, g_hInst, nullptr);
+    CreateWindowW(L"STATIC", L"调度结果列表", WS_CHILD | WS_VISIBLE, 465, 92, 160, 24, hwnd, nullptr, g_hInst, nullptr);
     g_resultList = CreateWindowW(WC_LISTVIEWW, L"", WS_CHILD | WS_VISIBLE | WS_BORDER | LVS_REPORT,
-                                 510, 120, 520, 210, hwnd, reinterpret_cast<HMENU>(IDC_RESULT_LIST), g_hInst, nullptr);
+                                 465, 120, 695, 210, hwnd, reinterpret_cast<HMENU>(IDC_RESULT_LIST), g_hInst, nullptr);
     ListView_SetExtendedListViewStyle(g_resultList, LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES);
-    AddListColumn(g_resultList, 0, 100, L"进程名");
-    AddListColumn(g_resultList, 1, 90, L"开始时间");
-    AddListColumn(g_resultList, 2, 90, L"完成时间");
-    AddListColumn(g_resultList, 3, 90, L"周转时间");
-    AddListColumn(g_resultList, 4, 120, L"带权周转时间");
+    AddListColumn(g_resultList, 0, 80, L"进程名");
+    AddListColumn(g_resultList, 1, 80, L"到达时间");
+    AddListColumn(g_resultList, 2, 80, L"服务时间");
+    AddListColumn(g_resultList, 3, 70, L"优先级");
+    AddListColumn(g_resultList, 4, 80, L"开始时间");
+    AddListColumn(g_resultList, 5, 80, L"完成时间");
+    AddListColumn(g_resultList, 6, 80, L"周转时间");
+    AddListColumn(g_resultList, 7, 110, L"带权周转");
 }
 
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -449,6 +592,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         CreateControls(hwnd);
         return 0;
     case WM_COMMAND:
+        if (LOWORD(wParam) == IDC_ALGO && HIWORD(wParam) == CBN_SELCHANGE) {
+            UpdateAlgorithmDescription();
+            return 0;
+        }
         switch (LOWORD(wParam)) {
         case IDC_ADD:
             AddProcessFromInput(hwnd);
@@ -466,6 +613,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         }
         case IDC_CLEAR:
             g_processes.clear();
+            g_nextInputOrder = 0;
             g_hasResult = false;
             RefreshProcessList();
             RefreshResultList();
@@ -506,7 +654,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
 
     RegisterClassW(&wc);
     HWND hwnd = CreateWindowExW(0, CLASS_NAME, L"进程调度模拟系统", WS_OVERLAPPEDWINDOW,
-                                CW_USEDEFAULT, CW_USEDEFAULT, 1080, 720,
+                                CW_USEDEFAULT, CW_USEDEFAULT, 1200, 760,
                                 nullptr, nullptr, hInstance, nullptr);
     if (!hwnd) return 0;
     ShowWindow(hwnd, nCmdShow);
